@@ -11,11 +11,15 @@ panel opens next to it with the apps inside. Click an app to launch it.
   other, and can be dragged to another cell (right-click > Lock positions to stop that).
 - **Fluent panel**: real Windows acrylic, follows the system light/dark theme, Windows 11 flyout animation.
   It closes when you click elsewhere, press Esc or switch to another window.
-- **Pages**: 16 apps (4x4) per page. More apps open a page to the right. Change pages with the mouse
-  wheel, by dragging the empty area left/right, or with the dots at the bottom.
+- **Pages**: 12 apps (4x3) per page. More apps open a page below. Change pages with the mouse
+  wheel, by dragging the empty area up/down, or with the dots on the right edge (arrows show on hover).
+- **Folders inside folders**: hold an app over another app (about half a second) to make a new folder from
+  both, or hold it over a folder to move it inside. Click a folder to open it in the same panel (the
+  content slides, the title changes and a back arrow appears). Drag an app to the left edge strip of the
+  panel to move it back up one level. Right-click empty space > New folder makes an empty one.
 - **Add apps**: drag a shortcut or an .exe onto a tile or onto the open panel. Shortcuts from the
   desktop are moved into the folder.
-- **Reorder**: drag an app inside the panel. Hold it at the left/right edge to move it to another page.
+- **Reorder**: drag an app inside the panel. Hold it at the top/bottom edge to move it to another page.
 - **Take apps out**: drag an app out of the panel and drop it on the desktop (it lands where you drop it)
   or on another tile (it moves to that folder). Right-click an app > Remove from folder also works.
 - **New folder**: right-click the desktop > New > App folder. The new folder opens with its name ready to edit.
@@ -35,7 +39,7 @@ Requires Windows 11 (build 22000 or newer), x64.
 
 | What | Where |
 | --- | --- |
-| Folders (each one is a normal directory of shortcuts) | `Documents\DeskFolders\<Folder>` |
+| Folders (each one is a normal directory of shortcuts; a folder inside a folder is a subdirectory) | `Documents\DeskFolders\<Folder>` |
 | Tile positions, lock state | `%LOCALAPPDATA%\GrupPopup\tiles.json` |
 | App order inside folders | `%LOCALAPPDATA%\GrupPopup\order.json` |
 | Errors | `%LOCALAPPDATA%\GrupPopup\crash.log` |

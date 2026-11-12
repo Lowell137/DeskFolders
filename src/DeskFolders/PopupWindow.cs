@@ -10,6 +10,7 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Hosting;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.Graphics;
 using Windows.UI;
 using WinRT.Interop;
@@ -31,8 +32,11 @@ sealed class PopupWindow : Window
 {
     // --- Windows 11 Başlat klasörü ölçüleri (DIP); yükseklik içerik satırına göre ---
     // sayfa = 4x4, Windows 11 Başlat gibi (dolunca sağda yeni sayfa)
-    const double PW = 432, Pad = 24, HeaderH = 84, CellH = 90, ItemW = 92, ItemH = 86, Icon = 36, PipsH = 32;
-    const int Cols = 4, MaxRows = 4, PerPage = Cols * MaxRows;
+    // sayfa = 4 sütun x 3 satır (Başlat klasörü kaydı); dolunca AŞAĞIYA yeni sayfa, sağda dikey noktalar
+    const double PW = 432, Pad = 24, HeaderH = 84, CellH = 90, ItemW = 92, ItemH = 86, Icon = 36;
+    const int Cols = 4, MaxRows = 3;
+    int PerPage => Cols * _rowsWin;
+    double PageH => _rowsWin * CellH;
     const double CellW = (PW - 2 * Pad) / Cols;
     const double AnchorDX = 54, AnchorDY = -17;   // panelin sol üstü, kutunun ortasına göre
     const double Slide = 24;                      // açılır panel kayma mesafesi (DIP)
@@ -56,6 +60,21 @@ sealed class PopupWindow : Window
     readonly Grid _root = new();          // pencerenin tamamı = panel (arka plan acrylic)
     readonly Grid _content = new();       // canlanan içerik
     readonly TextBox _title = new();
+    readonly Button _back = new();        // alt klasördeyken sol üstte ←
+    readonly Border _outTop = new(), _outLeft = new();   // alt klasörden sürüklerken "bir üst klasöre bırak" bölgesi
+    readonly TextBlock _outText = new();
+    readonly Border _outFillT = new(), _outFillL = new();
+    readonly Image _ghostImg = new();     // klasör geçişinde giden içeriğin görüntüsü
+    readonly List<string> _nav = new();   // üst klasörler (son = bir üst); boş = en üst klasördeyiz
+    string _top = "";                     // panelin açıldığı grup klasörü
+    bool _navBusy;
+    int _rowsWin = 1, _gap = -1, _gapCand = -1;
+    long _gapSince;
+    bool _backHot;
+    const double Shift = PW * 0.4;        // klasör geçişi kayma mesafesi (DIP)
+    const long MergeMs = 450;             // bir uygulamanın üstünde bu kadar durunca klasör oluşur / içine girer
+    Slot? _mergeCand, _mergeTarget;
+    long _mergeSince;
     readonly ScrollViewer _scroll = new();
     readonly PipsPager _pips = new();
     int _page, _pages = 1;
@@ -65,14 +84,14 @@ sealed class PopupWindow : Window
     const long EdgeMs = 380;        // kenarda bu kadar tutunca sayfa kayar
     readonly Border _edgeL = new(), _edgeR = new();
 
-    /// <summary>Kenar göstergesi: yarı saydam şerit + ok; EdgeMs boyunca soldan sağa dolar (Fluent vurgu rengi).</summary>
+    /// <summary>Kenar göstergesi: üst/alt yarı saydam şerit + ok; EdgeMs boyunca soldan sağa dolar (Fluent vurgu rengi).</summary>
     void BuildEdges()
     {
-        foreach (var (b, left) in new[] { (_edgeL, true), (_edgeR, false) })
+        foreach (var (b, up) in new[] { (_edgeL, true), (_edgeR, false) })   // _edgeL = üst, _edgeR = alt
         {
-            b.Width = 28; b.Margin = new Thickness(left ? 4 : 0, HeaderH, left ? 0 : 4, 0);
-            b.HorizontalAlignment = left ? HorizontalAlignment.Left : HorizontalAlignment.Right;
-            b.VerticalAlignment = VerticalAlignment.Top;
+            b.Height = 26; b.Margin = new Thickness(Pad, up ? HeaderH + 2 : 0, Pad, up ? 0 : 14);
+            b.HorizontalAlignment = HorizontalAlignment.Stretch;
+            b.VerticalAlignment = up ? VerticalAlignment.Top : VerticalAlignment.Bottom;
             b.CornerRadius = Res("ControlCornerRadius", new CornerRadius(4));
             b.Background = Res<Brush>("SubtleFillColorSecondaryBrush", new SolidColorBrush(Color.FromArgb(0x20, 255, 255, 255)));
             b.IsHitTestVisible = false;
@@ -80,7 +99,7 @@ sealed class PopupWindow : Window
             var g = new Grid();
             var fill = new Border { CornerRadius = b.CornerRadius, Background = Res<Brush>("AccentFillColorDefaultBrush", new SolidColorBrush(Colors.DodgerBlue)), Opacity = 0.35 };
             g.Children.Add(fill);
-            g.Children.Add(new FontIcon { Glyph = left ? "\uE76B" : "\uE76C", FontSize = 14, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center });
+            g.Children.Add(new FontIcon { Glyph = up ? "\uE70E" : "\uE70D", FontSize = 14, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center });
             b.Child = g;
             _content.Children.Add(b);
         }
@@ -89,15 +108,14 @@ sealed class PopupWindow : Window
     void ShowEdge(int dir)
     {
         Border b = dir < 0 ? _edgeL : _edgeR, other = dir < 0 ? _edgeR : _edgeL;
-        b.Height = _scroll.Height;
         Fade(other, 0, 100);
         Fade(b, 1, 120);
-        // dolum: dikey ölçek 0 → 1, EdgeMs içinde
+        // dolum: yatay ölçek 0 → 1, EdgeMs içinde
         var fill = (Border)((Grid)b.Child).Children[0];
         Visual v = ElementCompositionPreview.GetElementVisual(fill);
-        v.CenterPoint = new Vector3(0, (float)b.Height, 0);
+        v.CenterPoint = new Vector3(0, 0, 0);
         var a = v.Compositor.CreateVector3KeyFrameAnimation();
-        a.InsertKeyFrame(0f, new Vector3(1, 0, 1));
+        a.InsertKeyFrame(0f, new Vector3(0, 1, 1));
         a.InsertKeyFrame(1f, new Vector3(1, 1, 1), v.Compositor.CreateLinearEasingFunction());
         a.Duration = TimeSpan.FromMilliseconds(EdgeMs);
         v.StartAnimation("Scale", a);
@@ -128,31 +146,31 @@ sealed class PopupWindow : Window
     }
     bool _swipe;
     Slot? _swipeBy;                 // öğenin üstünden başlayan kaydırma
-    double _swipeX0, _swipeOff0;
+    double _swipeY0, _swipeOff0;
     const long HoldMs = 300;        // bu kadar basılı tutulursa sürükleme = sıralama; daha hızlıysa sayfa kaydırma
 
     void BeginSwipe(PointerRoutedEventArgs e, Slot? by = null)
     {
         _swipe = true; _swipeBy = by;
-        _swipeX0 = e.GetCurrentPoint(_root).Position.X;
-        _swipeOff0 = _page * PW;
+        _swipeY0 = e.GetCurrentPoint(_root).Position.Y;
+        _swipeOff0 = _page * PageH;
     }
 
     /// <summary>Parmağı izle: sayfa imleçle birlikte kayar, uçlarda hafif direnç.</summary>
     void SwipeMove(PointerRoutedEventArgs e)
     {
-        double dx = e.GetCurrentPoint(_root).Position.X - _swipeX0;
-        double max = (_pages - 1) * PW, off = _swipeOff0 - dx;
+        double dy = e.GetCurrentPoint(_root).Position.Y - _swipeY0;
+        double max = (_pages - 1) * PageH, off = _swipeOff0 - dy;
         if (off < 0) off /= 3; else if (off > max) off = max + (off - max) / 3;
-        _scroll.ChangeView(Math.Clamp(off, 0, max), null, null, true);
+        _scroll.ChangeView(null, Math.Clamp(off, 0, max), null, true);
     }
 
     /// <summary>Bırakınca: yeterince çekildiyse sonraki/önceki sayfa, değilse geri otur.</summary>
     void EndSwipe(PointerRoutedEventArgs e)
     {
-        double dx = e.GetCurrentPoint(_root).Position.X - _swipeX0;
+        double dy = e.GetCurrentPoint(_root).Position.Y - _swipeY0;
         _swipe = false; _swipeBy = null;
-        int target = dx < -PW / 6 ? _page + 1 : dx > PW / 6 ? _page - 1 : _page;
+        int target = dy < -PageH / 6 ? _page + 1 : dy > PageH / 6 ? _page - 1 : _page;
         GoPage(target);
     }
 
@@ -162,7 +180,7 @@ sealed class PopupWindow : Window
         pg = Math.Clamp(pg, 0, Math.Max(0, _pages - 1));
         _page = pg;
         if (_pips.SelectedPageIndex != pg) _pips.SelectedPageIndex = pg;
-        _scroll.ChangeView(pg * PW, null, null, instant);
+        _scroll.ChangeView(null, pg * PageH, null, instant);
     }
     readonly Canvas _canvas = new();
     readonly List<Slot> _slots = new();
@@ -227,9 +245,14 @@ sealed class PopupWindow : Window
         // tema: sistemi izle (RequestedTheme verilmez); yazı tipi tema varsayılanı Segoe UI Variable
         var pad = Res("FlyoutContentPadding", new Thickness(12));
         _root.Children.Add(_content);
+        _ghostImg.Stretch = Stretch.Fill; _ghostImg.IsHitTestVisible = false;
+        _ghostImg.HorizontalAlignment = HorizontalAlignment.Left; _ghostImg.VerticalAlignment = VerticalAlignment.Top;
+        _ghostImg.Visibility = Visibility.Collapsed;
+        ElementCompositionPreview.SetIsTranslationEnabled(_ghostImg, true);
+        _root.Children.Add(_ghostImg);
 
         // ad: Fluent TextBox; boşta zeminsiz, üzerine gelince/odakta temanın kendi görünümü
-        _title.Width = PW - 2 * Pad;
+        _title.Width = PW - 2 * 76;                          // ← düğmesinin altına uzanmasın
         _title.HorizontalAlignment = HorizontalAlignment.Center;
         _title.VerticalAlignment = VerticalAlignment.Top;
         _title.Margin = new Thickness(0, 26, 0, 0);
@@ -251,12 +274,55 @@ sealed class PopupWindow : Window
         _title.LostFocus += (_, _) => CommitRename();
         _content.Children.Add(_title);
 
+        // ← : bir üst klasöre dön (Windows 11 Başlat klasörü gibi)
+        _back.Content = new FontIcon { Glyph = "", FontSize = 14 };
+        _back.Width = 36; _back.Height = 36; _back.Padding = new Thickness(0);
+        _back.HorizontalAlignment = HorizontalAlignment.Left;
+        _back.VerticalAlignment = VerticalAlignment.Top;
+        _back.Margin = new Thickness(16, 28, 0, 0);
+        _back.CornerRadius = Res("ControlCornerRadius", new CornerRadius(4));
+        _back.Visibility = Visibility.Collapsed;
+        PlateOff(_back, false);
+        _back.Click += (_, _) => GoBack();
+        _content.Children.Add(_back);
+
+        // sürüklerken görünen bırakma bölgesi: üst başlık şeridi + sol kenar şeridi
+        // Sayfa kenar göstergesiyle (BuildEdges) aynı stil: tema fırçalı şerit + vurgu dolgusu + ok ikonu, sabit renk yok.
+        _outTop.Margin = new Thickness(Pad, 16, Pad, 0); _outTop.Height = HeaderH - 40;
+        _outTop.VerticalAlignment = VerticalAlignment.Top; _outTop.HorizontalAlignment = HorizontalAlignment.Stretch;
+        _outLeft.Margin = new Thickness(4, HeaderH - 8, 0, 14); _outLeft.Width = 20;
+        _outLeft.VerticalAlignment = VerticalAlignment.Stretch; _outLeft.HorizontalAlignment = HorizontalAlignment.Left;
+        foreach (var (z, fill) in new[] { (_outTop, _outFillT), (_outLeft, _outFillL) })
+        {
+            z.CornerRadius = Res("ControlCornerRadius", new CornerRadius(4));
+            z.Background = Res<Brush>("SubtleFillColorSecondaryBrush", new SolidColorBrush(Color.FromArgb(0x20, 255, 255, 255)));
+            z.IsHitTestVisible = false; z.Opacity = 0;
+            fill.CornerRadius = z.CornerRadius;
+            fill.Background = Res<Brush>("AccentFillColorDefaultBrush", new SolidColorBrush(Colors.DodgerBlue));
+            fill.Opacity = 0.35;                     // kenar göstergesiyle aynı: dolgu ölçekle dolar (SetOutHot)
+            var g = new Grid();
+            g.Children.Add(fill);
+            if (z == _outTop)
+            {
+                var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+                row.Children.Add(new FontIcon { Glyph = "", FontSize = 14 });   // kenar göstergesindeki yukarı ok
+                row.Children.Add(_outText);
+                g.Children.Add(row);
+            }
+            else g.Children.Add(new FontIcon { Glyph = "", FontSize = 14, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center });
+            z.Child = g;
+            if (z == _outLeft) _content.Children.Add(z);      // yalnız sol şerit görünür; üst başlık bölgesi yok
+        }
+        _outText.VerticalAlignment = VerticalAlignment.Center;
+        if (Res<Style?>("BodyStrongTextBlockStyle", null) is Style ocs) _outText.Style = ocs;
+        SetOutHot(false);
+
         _scroll.Margin = new Thickness(0, HeaderH, 0, 0);
         _scroll.VerticalAlignment = VerticalAlignment.Top;
-        _scroll.VerticalScrollMode = ScrollMode.Disabled;
-        _scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Disabled;
-        _scroll.HorizontalScrollMode = ScrollMode.Disabled;   // kullanıcı kaydırması yok; ChangeView ile biz süreriz
-        _scroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden;
+        _scroll.VerticalScrollMode = ScrollMode.Disabled;     // kullanıcı kaydırması yok; ChangeView ile biz süreriz
+        _scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Hidden;
+        _scroll.HorizontalScrollMode = ScrollMode.Disabled;
+        _scroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
         _scroll.ZoomMode = ZoomMode.Disabled;
         _canvas.Width = PW;
         _canvas.VerticalAlignment = VerticalAlignment.Top;
@@ -289,11 +355,12 @@ sealed class PopupWindow : Window
             e.Handled = true;
         }), true);
         // sayfa noktaları (Fluent PipsPager)
-        _pips.HorizontalAlignment = HorizontalAlignment.Center;
-        _pips.VerticalAlignment = VerticalAlignment.Bottom;
-        _pips.Margin = new Thickness(0, 0, 0, 4);
-        _pips.PreviousButtonVisibility = PipsPagerButtonVisibility.Collapsed;
-        _pips.NextButtonVisibility = PipsPagerButtonVisibility.Collapsed;
+        _pips.Orientation = Orientation.Vertical;            // sağ kenarda dikey noktalar (Başlat klasörü)
+        _pips.HorizontalAlignment = HorizontalAlignment.Right;
+        _pips.VerticalAlignment = VerticalAlignment.Center;
+        _pips.Margin = new Thickness(0, HeaderH, 4, 12);
+        _pips.PreviousButtonVisibility = PipsPagerButtonVisibility.VisibleOnPointerOver;   // noktaların üstünde ▲ altında ▼ (Başlat klasörü)
+        _pips.NextButtonVisibility = PipsPagerButtonVisibility.VisibleOnPointerOver;
         _pips.SelectedIndexChanged += (_, _) => { if (_pips.SelectedPageIndex != _page) GoPage(_pips.SelectedPageIndex); };
         _content.Children.Add(_pips);
         BuildEdges();
@@ -307,13 +374,24 @@ sealed class PopupWindow : Window
         var sort = new MenuFlyoutItem { Text = "Sort by name", Icon = new SymbolIcon(Symbol.Sort) };
         sort.Click += (_, _) =>
         {
-            Order.Forget(Path.GetFileName(_folder.TrimEnd('\\', '/')));
+            Order.Forget(Order.Key(_folder));
             Icons.Invalidate(_folder);
             _popSig = "";
             Populate(_folder);
             GoPage(0);
             Tiles.Refresh();
         };
+        var newSub = new MenuFlyoutItem { Text = "New folder", Icon = new SymbolIcon(Symbol.NewFolder) };
+        newSub.Click += (_, _) =>
+        {
+            try { Groups.New(_folder); } catch (Exception e) { Log(e); return; }
+            Icons.Invalidate(_folder);
+            _popSig = "";
+            Populate(_folder);
+            EnsureSize();
+            Tiles.Refresh();
+        };
+        pm.Items.Add(newSub);
         pm.Items.Add(ren);
         pm.Items.Add(sort);
         pm.Items.Add(new MenuFlyoutSeparator());
@@ -336,10 +414,17 @@ sealed class PopupWindow : Window
             if (!e.DataView.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.StorageItems)) return;
             if (_oleDrag) return;   // kendi öğesi geri bırakıldı
             var items = await e.DataView.GetStorageItemsAsync();
-            if (Groups.Add(_folder, items.Select(i => i.Path)) > 0)
+            // bir alt klasör hücresinin üstüne bırakıldıysa onun içine, yoksa açık klasöre
+            var pos = e.GetPosition(_canvas);
+            Slot? hit = _slots.FirstOrDefault(sl => Directory.Exists(sl.It.Path)
+                && pos.X >= Canvas.GetLeft(sl.Btn) && pos.X < Canvas.GetLeft(sl.Btn) + ItemW
+                && pos.Y >= Canvas.GetTop(sl.Btn) && pos.Y < Canvas.GetTop(sl.Btn) + ItemH);
+            if (Groups.Add(hit?.It.Path ?? _folder, items.Select(i => i.Path)) > 0)
             {
+                Icons.Invalidate(_folder);
                 _popSig = "";
                 Populate(_folder);
+                EnsureSize();
                 Tiles.Refresh();
             }
         };
@@ -349,6 +434,7 @@ sealed class PopupWindow : Window
         {
             a.Handled = true;
             if (_title.FocusState != FocusState.Unfocused) { _title.Text = Path.GetFileName(_folder); FocusItems(); }
+            else if (_nav.Count > 0) GoBack();      // alt klasördeyken Esc bir üst klasöre döner
             else Dismiss(false);
         };
         _root.KeyboardAccelerators.Add(esc);
@@ -371,7 +457,7 @@ sealed class PopupWindow : Window
     {
         if (_anim) return;
         long now = Environment.TickCount64;
-        bool same = r.Folder.Equals(_folder, StringComparison.OrdinalIgnoreCase);
+        bool same = r.Folder.Equals(_top, StringComparison.OrdinalIgnoreCase);
         if (_visible && !_closing && same)
         {
             if (now - _openTick < 700) return;
@@ -392,14 +478,17 @@ sealed class PopupWindow : Window
         _anim = true;
         try
         {
-            _folder = r.Folder;
+            _folder = r.Folder; _top = r.Folder; _nav.Clear(); _navBusy = false;
+            _back.Visibility = Visibility.Collapsed; _ghostImg.Visibility = Visibility.Collapsed;
             Populate(r.Folder);
             FocusItems();
 
-            // panel boyu içerik satırına göre (en çok 3 satır, fazlası kaydırılır)
+            // panel boyu içerik satırına göre (en çok 4 satır; alt klasörde daha fazlası gerekirse büyür, küçülmez)
             int rows = Math.Clamp((_slots.Count + Cols - 1) / Cols, 1, MaxRows);
-            _ph = HeaderH + rows * CellH + (_pages > 1 ? PipsH : 12);
+            _rowsWin = rows;
+            _ph = HeaderH + rows * CellH + 12;
             _scroll.Height = rows * CellH;
+            Layout(null, -1, snap: true);                // sayfa boyu (satır sayısı) belli oldu
             GoPage(0, instant: true);
             int pw = (int)Math.Round(PW * _scale), ph = (int)Math.Round(_ph * _scale), m = (int)(8 * _scale);
             RectInt32 wa = DisplayArea.GetFromPoint(c, DisplayAreaFallback.Nearest).WorkArea;
@@ -568,6 +657,7 @@ sealed class PopupWindow : Window
     {
         string sig = Icons.Signature(folder);
         _title.Text = Path.GetFileName(folder.TrimEnd('\\', '/'));
+        _mergeCand = _mergeTarget = null;
         if (folder.Equals(_popFolder, StringComparison.OrdinalIgnoreCase) && sig == _popSig) return;
         _popFolder = folder; _popSig = sig;
 
@@ -593,10 +683,10 @@ sealed class PopupWindow : Window
         Layout(null, -1, snap: true);
     }
 
-    static (double, double) SlotPos(int i)
+    (double, double) SlotPos(int i)
     {
         int page = i / PerPage, j = i % PerPage;
-        return (page * PW + Pad + (j % Cols) * CellW + (CellW - ItemW) / 2, (j / Cols) * CellH);
+        return (Pad + (j % Cols) * CellW + (CellW - ItemW) / 2, page * PageH + (j / Cols) * CellH);
     }
 
     void Layout(Slot? skip, int gap, bool snap = false)
@@ -611,10 +701,9 @@ sealed class PopupWindow : Window
             Canvas.SetLeft(s.Btn, x);
             Canvas.SetTop(s.Btn, y);
         }
-        int rows = Math.Clamp((_slots.Count + Cols - 1) / Cols, 1, MaxRows);
-        _canvas.Height = rows * CellH;
         _pages = Math.Max(1, (_slots.Count + PerPage - 1) / PerPage);
-        _canvas.Width = _pages * PW;
+        _canvas.Height = _pages * PageH;
+        _canvas.Width = PW;
         _pips.NumberOfPages = _pages;
         _pips.Visibility = _pages > 1 ? Visibility.Visible : Visibility.Collapsed;
         if (_page > _pages - 1) GoPage(_pages - 1);
@@ -642,7 +731,8 @@ sealed class PopupWindow : Window
     Button MakeButton(Item it)
     {
         var stack = new StackPanel { Spacing = 6, HorizontalAlignment = HorizontalAlignment.Center };
-        stack.Children.Add(new Image { Width = Icon, Height = Icon, Source = it.Icon, Stretch = Stretch.Uniform });
+        stack.Children.Add(Directory.Exists(it.Path) ? FolderGlyph(it)
+            : new Image { Width = Icon, Height = Icon, Source = it.Icon, Stretch = Stretch.Uniform });
         var label = new TextBlock
         {
             Text = it.Name, TextAlignment = TextAlignment.Center,
@@ -665,12 +755,11 @@ sealed class PopupWindow : Window
         {
             if (_suppressClick) { _suppressClick = false; return; }
             if (Environment.TickCount64 - _openTick < 350) return;
-            try { Process.Start(new ProcessStartInfo(it.Path) { UseShellExecute = true }); } catch { }
-            Dismiss(false);
+            Activate(it);
         };
         var menu = new MenuFlyout();
         var open = new MenuFlyoutItem { Text = "Open", Icon = new SymbolIcon(Symbol.OpenFile) };
-        open.Click += (_, _) => { try { Process.Start(new ProcessStartInfo(it.Path) { UseShellExecute = true }); } catch { } Dismiss(false); };
+        open.Click += (_, _) => Activate(it);
         var remove = new MenuFlyoutItem { Text = "Remove from folder", Icon = new SymbolIcon(Symbol.Remove) };
         remove.Click += (_, _) => { var s = _slots.FirstOrDefault(x => x.It == it); if (s != null) RemoveItem(s); };
         menu.Items.Add(open);
@@ -681,6 +770,38 @@ sealed class PopupWindow : Window
         b.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler(OnItemReleased), true);
         b.AddHandler(UIElement.PointerCaptureLostEvent, new PointerEventHandler(OnItemReleased), true);
         return b;
+    }
+
+    /// <summary>Uygulama: çalıştırıp paneli kapat. Alt klasör: panelin içinde aç (kayarak).</summary>
+    void Activate(Item it)
+    {
+        if (Directory.Exists(it.Path)) { Navigate(it.Path, +1); return; }
+        try { Process.Start(new ProcessStartInfo(it.Path) { UseShellExecute = true }); } catch { }
+        Dismiss(false);
+    }
+
+    /// <summary>Alt klasörün hücre ikonu: içindeki ilk 4 uygulamanın mini önizlemesi (boşsa Windows klasör ikonu).</summary>
+    UIElement FolderGlyph(Item it)
+    {
+        List<ItemData> prev;
+        try { prev = Icons.GetData(it.Path).Take(4).ToList(); } catch { prev = new(); }
+        if (prev.Count == 0) return new Image { Width = Icon, Height = Icon, Source = it.Icon, Stretch = Stretch.Uniform };
+        var g = new Grid();
+        g.RowDefinitions.Add(new RowDefinition()); g.RowDefinitions.Add(new RowDefinition());
+        g.ColumnDefinitions.Add(new ColumnDefinition()); g.ColumnDefinitions.Add(new ColumnDefinition());
+        for (int i = 0; i < prev.Count; i++)
+        {
+            var im = new Image { Source = Icons.ToSource(prev[i].Pix), Stretch = Stretch.Uniform, Margin = new Thickness(1) };
+            Grid.SetRow(im, i / 2); Grid.SetColumn(im, i % 2);
+            g.Children.Add(im);
+        }
+        Brush fill = Res<Brush>("CardBackgroundFillColorDefaultBrush", new SolidColorBrush(Color.FromArgb(0x30, 255, 255, 255)));
+        Brush line = Res<Brush>("CardStrokeColorDefaultBrush", new SolidColorBrush(Color.FromArgb(0x20, 255, 255, 255)));
+        return new Border
+        {
+            Width = Icon, Height = Icon, Padding = new Thickness(3), CornerRadius = new CornerRadius(8),
+            Background = fill, BorderBrush = line, BorderThickness = new Thickness(1), Child = g,
+        };
     }
 
     /// <summary>Düğme zeminleri tema fırçalarından (Subtle fill); sürüklerken plakasız.</summary>
@@ -736,6 +857,8 @@ sealed class PopupWindow : Window
     void StartReorder(Slot s)
     {
         _drag = true; _suppressClick = true; _dragSlot = s;
+        _gap = Math.Max(0, _slots.IndexOf(s)); _gapCand = -1; _mergeCand = _mergeTarget = null;
+        if (_nav.Count > 0) ShowOut(true);
         Lift(s.Btn, true);
         ElementCompositionPreview.GetElementVisual(s.Btn).ImplicitAnimations = null;
         PlateOff(s.Btn, true);
@@ -750,22 +873,26 @@ sealed class PopupWindow : Window
     void DragTick(DispatcherQueueTimer t, object o)
     {
         Slot? s = _dragSlot;
-        if (s == null || !_visible) { t.Stop(); _drag = false; return; }
+        if (s == null || !_visible) { ShowOut(false); t.Stop(); _drag = false; return; }
         GetCursorPos(out POINT c);
         double rx = (c.X - _win.X) / _scale, ry = (c.Y - _win.Y) / _scale;      // pencere içi (DIP)
         var co = _canvas.TransformToVisual(_root).TransformPoint(new Windows.Foundation.Point(0, 0));
         var p = new Windows.Foundation.Point(rx - co.X, ry - co.Y);              // tuval içi (sayfa kaydırması dahil)
         bool down = (GetAsyncKeyState(0x01) & 0x8000) != 0;
 
-        if (!down) { t.Stop(); DropReorder(s, p); return; }
+        bool overBack = _nav.Count > 0 && rx >= 0 && rx <= 30 && ry >= HeaderH - 8 && ry <= _ph;      // yalnız sol kenar şeridi = bir üst klasör
+        if (overBack != _backHot) { _backHot = overBack; SetOutHot(overBack); }
+        if (!down) { ShowOut(false); t.Stop(); if (overBack) DropToParent(s); else DropReorder(s, p); return; }
         if (rx < 0 || ry < 0 || rx > PW || ry > _ph)                           // panelden çıktı: dışarı sürükleme
         {
+            ClearMerge(); ShowOut(false);
             t.Stop(); _drag = false; _dragSlot = null; _press = null;
             StartOleDrag(s, null);
             return;
         }
         // kenarda tut: ok göstergesi dolar, dolunca sayfa kayar; tutmaya devam = art arda
-        int dir = rx < EdgeW ? -1 : rx > PW - EdgeW ? 1 : 0;
+        double top = HeaderH, bot = HeaderH + _scroll.Height;
+        int dir = overBack ? 0 : ry < top + EdgeW ? -1 : ry > bot - EdgeW ? 1 : 0;
         if (dir != 0 && _page + dir >= 0 && _page + dir < _pages)
         {
             long now = Environment.TickCount64;
@@ -775,7 +902,108 @@ sealed class PopupWindow : Window
         else if (_edgeSince != 0) { _edgeSince = 0; _edgeDir = 0; HideEdge(); }
         Canvas.SetLeft(s.Btn, p.X - _grab.X);
         Canvas.SetTop(s.Btn, p.Y - _grab.Y);
-        Layout(s, TargetIndex(p));
+        if (overBack) ClearMerge(); else UpdateGapOrMerge(s, p);
+    }
+
+    /// <summary>
+    /// Sürüklenen öğe bir hücrenin ortasında duruyorsa: MergeMs sonra o uygulamayla klasör olur (üstü klasörse içine girer);
+    /// hücrenin kenarındaysa normal sıralama (boşluk imleci izler). Hücre ortasında boşluk oynamaz, altındaki öğe yerinde kalır.
+    /// </summary>
+    void UpdateGapOrMerge(Slot s, Windows.Foundation.Point p)
+    {
+        int page = Math.Clamp((int)Math.Floor(p.Y / PageH), 0, _pages - 1);
+        int col = Math.Clamp((int)Math.Floor((p.X - Pad) / CellW), 0, Cols - 1);
+        int row = Math.Clamp((int)Math.Floor((p.Y - page * PageH) / CellH), 0, _rowsWin - 1);
+        int ci = page * PerPage + row * Cols + col;
+        var (cx, cy) = SlotPos(ci);
+        bool center = Math.Abs(p.X - (cx + ItemW / 2)) < 22 && Math.Abs(p.Y - (cy + 30)) < 22;   // yalnız ikonun üstü
+
+        Slot? vis = null;
+        if (ci != _gap)
+        {
+            var others = _slots.Where(x => x != s).ToList();
+            int pos = ci < _gap ? ci : ci - 1;
+            if (pos >= 0 && pos < others.Count) vis = others[pos];
+        }
+
+        long now = Environment.TickCount64;
+        if (ci == _gap) { ClearMerge(); _gapCand = -1; return; }
+        if (center && vis != null)
+        {
+            _gapCand = -1;
+            long need = Directory.Exists(vis.It.Path) ? 120 : MergeMs;      // klasörün içine hemen, uygulamayla klasör için bekle
+            if (_mergeCand != vis) { ClearMerge(); _mergeCand = vis; _mergeSince = now; }
+            else if (_mergeTarget == null && now - _mergeSince > need)
+            {
+                _mergeTarget = vis;
+                Lift(vis.Btn, true);
+                PlateMark(vis.Btn, true);
+            }
+            return;
+        }
+        ClearMerge();
+        int g = TargetIndex(p);
+        if (g == _gap) { _gapCand = -1; return; }
+        if (_gapCand != g) { _gapCand = g; _gapSince = now; return; }       // boşluk, hücrede biraz durunca kayar (geçerken oynamaz)
+        if (now - _gapSince > 120) { _gap = g; _gapCand = -1; Layout(s, _gap); }
+    }
+
+    void ShowOut(bool on)
+    {
+        if (on) _outText.Text = "Move to " + Path.GetFileName(_nav[^1].TrimEnd('\\', '/'));
+        Fade(_outLeft, on ? 1 : 0, on ? 150 : 120);
+        if (!on) SetOutHot(false);
+    }
+
+    void SetOutHot(bool hot)
+    {
+        // kenar göstergesiyle aynı animasyon: vurgu dolgusu EdgeMs boyunca soldan sağa (sol şeritte yukarıdan aşağı) dolar
+        foreach (var (fill, vertical) in new[] { (_outFillT, false), (_outFillL, true) })
+        {
+            Visual v = ElementCompositionPreview.GetElementVisual(fill);
+            v.CenterPoint = Vector3.Zero;
+            Vector3 empty = vertical ? new Vector3(1, 0, 1) : new Vector3(0, 1, 1);
+            if (hot)
+            {
+                var a = v.Compositor.CreateVector3KeyFrameAnimation();
+                a.InsertKeyFrame(0f, empty);
+                a.InsertKeyFrame(1f, Vector3.One, v.Compositor.CreateLinearEasingFunction());
+                a.Duration = TimeSpan.FromMilliseconds(EdgeMs);
+                v.StartAnimation("Scale", a);
+            }
+            else { v.StopAnimation("Scale"); v.Scale = empty; }
+        }
+    }
+
+    void ClearMerge()
+    {
+        if (_mergeTarget != null) { Lift(_mergeTarget.Btn, false); PlateMark(_mergeTarget.Btn, false); }
+        _mergeCand = _mergeTarget = null;
+    }
+
+    /// <summary>Klasör oluşturma/girme işareti: hücre vurgu renginde hafif dolar.</summary>
+    static void PlateMark(Button b, bool on)
+    {
+        try
+        {
+            Brush clear = new SolidColorBrush(Colors.Transparent);
+            Brush acc = Res<Brush>("AccentFillColorDefaultBrush", new SolidColorBrush(Colors.DodgerBlue));
+            if (on)
+            {
+                b.Resources["ButtonBackground"] = new SolidColorBrush(Color.FromArgb(0x55, 0x60, 0xA0, 0xFF));
+                b.Resources["ButtonBackgroundPointerOver"] = b.Resources["ButtonBackground"];
+                b.Resources["ButtonBackgroundPressed"] = b.Resources["ButtonBackground"];
+                b.Resources["ButtonBorderBrush"] = acc;
+            }
+            else
+            {
+                PlateOff(b, false);
+                b.Resources["ButtonBackground"] = clear;
+                b.Resources["ButtonBorderBrush"] = new SolidColorBrush(Colors.Transparent);
+            }
+            VisualStateManager.GoToState(b, "Normal", false);
+        }
+        catch { }
     }
 
     void DropReorder(Slot s, Windows.Foundation.Point p)
@@ -783,7 +1011,16 @@ sealed class PopupWindow : Window
         _drag = false; _dragSlot = null; _press = null;
         Lift(s.Btn, false);
         if (_edgeSince != 0) { _edgeSince = 0; _edgeDir = 0; HideEdge(); }
-        int target = TargetIndex(p);
+        if (_mergeTarget != null)                                   // üstünde durulan uygulamayla klasör / klasörün içine
+        {
+            Slot t = _mergeTarget; _mergeTarget = _mergeCand = null;
+            try { s.Btn.ReleasePointerCaptures(); } catch { }
+            DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () => _suppressClick = false);
+            MergeInto(s, t);
+            return;
+        }
+        ClearMerge();
+        int target = TargetIndex(p);                                  // bırakılan hücreye yerleş
         _slots.Remove(s);
         _slots.Insert(Math.Clamp(target, 0, _slots.Count), s);
         EnableSlide(s.Btn);
@@ -795,6 +1032,50 @@ sealed class PopupWindow : Window
         Order.Set(_folder, _slots.Select(x => Path.GetFileName(x.It.Path)));
         Icons.Invalidate(_folder);
         _popSig = Icons.Signature(_folder);
+        Tiles.Refresh();
+    }
+
+    /// <summary>Öğe ← üstüne bırakıldı: bir üst klasöre taşınır.</summary>
+    void DropToParent(Slot s)
+    {
+        _drag = false; _dragSlot = null; _press = null;
+        _backHot = false; PlateMark(_back, false);
+        Lift(s.Btn, false);
+        if (_edgeSince != 0) { _edgeSince = 0; _edgeDir = 0; HideEdge(); }
+        ClearMerge();
+        DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () => _suppressClick = false);
+        try { s.Btn.ReleasePointerCaptures(); } catch { }
+        string parent = _nav[^1];
+        if (Groups.MoveTo(_folder, parent, s.It.Path)) { Icons.Invalidate(parent); ItemLeft(s); }
+        else { Canvas.SetZIndex(s.Btn, 0); PlateOff(s.Btn, false); Layout(null, -1); }
+    }
+
+    /// <summary>
+    /// s, t'nin üstüne bırakıldı. t klasörse s onun içine taşınır; değilse yeni bir alt klasör ("New folder") açılır,
+    /// ikisi de içine girer ve klasör t'nin yerinde durur.
+    /// </summary>
+    void MergeInto(Slot s, Slot t)
+    {
+        string from = _folder, sp = s.It.Path, tp = t.It.Path;
+        var names = _slots.Where(x => x != s).Select(x => Path.GetFileName(x.It.Path)).ToList();
+        string dest = tp;
+        try
+        {
+            if (!Directory.Exists(tp))
+            {
+                dest = Groups.New(from);
+                if (!Groups.MoveTo(from, dest, tp)) { Directory.Delete(dest); throw new IOException("move failed"); }
+                int i = names.FindIndex(n => n.Equals(Path.GetFileName(tp), StringComparison.OrdinalIgnoreCase));
+                if (i >= 0) names[i] = Path.GetFileName(dest);
+            }
+            if (!sp.Equals(dest, StringComparison.OrdinalIgnoreCase)) Groups.MoveTo(from, dest, sp);
+            Order.Set(from, names);
+        }
+        catch (Exception e) { Log(e); }
+        Icons.Invalidate(from); Icons.Invalidate(dest);
+        _popSig = "";
+        Populate(from);
+        EnsureSize();
         Tiles.Refresh();
     }
 
@@ -816,6 +1097,7 @@ sealed class PopupWindow : Window
     {
         if (_oleDrag) return;
         _oleDrag = true;
+        ClearMerge();
         _press = null; _drag = false;
         Lift(s.Btn, false);
         if (_edgeSince != 0) { _edgeSince = 0; _edgeDir = 0; HideEdge(); }
@@ -878,24 +1160,42 @@ sealed class PopupWindow : Window
         _slots.Remove(s);
         _canvas.Children.Remove(s.Btn);
         Icons.Invalidate(_folder);
-        if (_slots.Count == 0)
-        {
-            string f = _folder;
-            Dismiss(false);
-            DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, async () => { await Task.Delay(400); Groups.Dissolve(f); Tiles.Refresh(); });
-            return;
-        }
+        if (_slots.Count == 0) { Emptied(); return; }
         Layout(null, -1);
         Order.Set(_folder, _slots.Select(x => Path.GetFileName(x.It.Path)));
         _popSig = Icons.Signature(_folder);
         Tiles.Refresh();
     }
 
+    /// <summary>
+    /// Son uygulama çıktı. En üst klasör: panel kapanır, klasör kalkar. Alt klasör: bir üst klasöre kayarak dönülür,
+    /// boşalan alt klasör silinir.
+    /// </summary>
+    void Emptied()
+    {
+        string f = _folder;
+        if (_nav.Count > 0)
+        {
+            GoBack();
+            DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, async () =>
+            {
+                await Task.Delay(450);
+                try { Directory.Delete(f); Order.Forget(Order.Key(f)); } catch { }
+                Icons.Invalidate(f); Icons.Invalidate(_folder);
+                if (_visible) { _popSig = ""; Populate(_folder); }
+                Tiles.Refresh();
+            });
+            return;
+        }
+        Dismiss(false);
+        DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, async () => { await Task.Delay(400); Groups.Dissolve(f); Tiles.Refresh(); });
+    }
+
     int TargetIndex(Windows.Foundation.Point p)
     {
-        int page = Math.Clamp((int)Math.Floor(p.X / PW), 0, _pages - 1);
-        int col = Math.Clamp((int)Math.Floor((p.X - page * PW - Pad) / CellW), 0, Cols - 1);
-        int row = Math.Clamp((int)Math.Floor(p.Y / CellH), 0, MaxRows - 1);
+        int page = Math.Clamp((int)Math.Floor(p.Y / PageH), 0, _pages - 1);
+        int col = Math.Clamp((int)Math.Floor((p.X - Pad) / CellW), 0, Cols - 1);
+        int row = Math.Clamp((int)Math.Floor((p.Y - page * PageH) / CellH), 0, _rowsWin - 1);
         return Math.Clamp(page * PerPage + row * Cols + col, 0, Math.Max(0, _slots.Count - 1));
     }
 
@@ -928,23 +1228,109 @@ sealed class PopupWindow : Window
         if (!Groups.Remove(_folder, s.It.Path)) { Layout(null, -1); return; }
         _slots.Remove(s);
         _canvas.Children.Remove(s.Btn);
-        if (_slots.Count == 0)
-        {
-            string f = _folder;
-            Dismiss(false);
-            DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, async () =>
-            {
-                await Task.Delay(400);
-                Groups.Dissolve(f);
-                Tiles.Refresh();
-            });
-            return;
-        }
+        if (_slots.Count == 0) { Emptied(); return; }
         Layout(null, -1);
         Order.Set(_folder, _slots.Select(x => Path.GetFileName(x.It.Path)));
         Icons.Invalidate(_folder);
         _popSig = Icons.Signature(_folder);
         Tiles.Refresh();
+    }
+
+    // ---------- alt klasörler: panelin içinde açılır, kayarak ----------
+
+    void GoBack()
+    {
+        if (_nav.Count == 0 || _navBusy) return;
+        Navigate(_nav[^1], -1);
+    }
+
+    /// <summary>
+    /// Windows 11 Başlat klasörü geçişi: giden içerik sola kayıp solar, gelen sağdan kayıp belirir (geri dönüşte ters yön).
+    /// Giden içeriğin görüntüsü (RenderTargetBitmap) alınıp ayrı bir katmanda kaydırılır; pencere boyutu animasyonda
+    /// değişmez, yalnız alt klasör daha çok satır istiyorsa bir kez büyür.
+    /// </summary>
+    async void Navigate(string target, int dir)
+    {
+        if (_navBusy || _anim || _closing || !_visible) return;
+        _navBusy = true;
+        try
+        {
+            if (_title.FocusState != FocusState.Unfocused)
+            {
+                string before = _folder;
+                CommitRename();
+                if (dir > 0 && !before.Equals(_folder, StringComparison.OrdinalIgnoreCase)) target = Path.Combine(_folder, Path.GetFileName(target));
+            }
+            if (!Directory.Exists(target)) { _popSig = ""; Populate(_folder); return; }
+
+            var rtb = new RenderTargetBitmap();
+            await rtb.RenderAsync(_content, (int)Math.Round(PW * _scale), (int)Math.Round(_ph * _scale));
+            _ghostImg.Source = rtb; _ghostImg.Width = PW; _ghostImg.Height = _ph;
+            Visual gv = ElementCompositionPreview.GetElementVisual(_ghostImg);
+            gv.Opacity = 1; gv.Properties.InsertVector3("Translation", Vector3.Zero);
+            _ghostImg.Visibility = Visibility.Visible;
+
+            if (dir > 0) _nav.Add(_folder); else _nav.RemoveAt(_nav.Count - 1);
+            _folder = target; _popSig = "";
+            Populate(target);
+            _page = 0; GoPage(0, instant: true);
+            _back.Visibility = _nav.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            bool grown = EnsureSize();
+
+            Visual cv = ElementCompositionPreview.GetElementVisual(_content);
+            cv.Opacity = 0;
+            if (grown) await Frames(2);
+            FocusItems();
+
+            Compositor c = cv.Compositor;
+            var ease = c.CreateCubicBezierEasingFunction(new Vector2(0f, 0f), new Vector2(0f, 1f));
+            var dur = TimeSpan.FromMilliseconds(300);
+            Vector3KeyFrameAnimation SlideAnim(float from, float to)
+            {
+                var a = c.CreateVector3KeyFrameAnimation();
+                a.Duration = dur;
+                a.InsertKeyFrame(0f, new Vector3(from, 0, 0));
+                a.InsertKeyFrame(1f, new Vector3(to, 0, 0), ease);
+                return a;
+            }
+            ScalarKeyFrameAnimation FadeAnim(float from, float to, int ms)
+            {
+                var a = c.CreateScalarKeyFrameAnimation();
+                a.Duration = TimeSpan.FromMilliseconds(ms);
+                a.InsertKeyFrame(0f, from);
+                a.InsertKeyFrame(1f, to, ease);
+                return a;
+            }
+            cv.StartAnimation("Translation", SlideAnim((float)(dir * Shift), 0));
+            cv.StartAnimation("Opacity", FadeAnim(0, 1, 250));
+            gv.StartAnimation("Translation", SlideAnim(0, (float)(-dir * Shift)));
+            gv.StartAnimation("Opacity", FadeAnim(1, 0, 200));
+            await Task.Delay(320);
+        }
+        catch (Exception e) { Log(e); }
+        finally
+        {
+            _ghostImg.Visibility = Visibility.Collapsed;
+            _ghostImg.Source = null;
+            _navBusy = false;
+        }
+    }
+
+    /// <summary>Alt klasör daha çok satır / sayfa noktası istiyorsa pencere bir kez büyür (küçülmez). Büyüdüyse true.</summary>
+    bool EnsureSize()
+    {
+        int rows = Math.Clamp((_slots.Count + Cols - 1) / Cols, 1, MaxRows);
+        if (rows > _rowsWin) { _rowsWin = rows; _scroll.Height = rows * CellH; Layout(null, -1, snap: true); GoPage(_page, instant: true); }
+        double ph = HeaderH + _rowsWin * CellH + 12;
+        if (ph <= _ph + 0.5) return false;
+        _ph = ph;
+        int h = (int)Math.Round(_ph * _scale), m = (int)(8 * _scale);
+        RectInt32 wa = DisplayArea.GetFromPoint(new PointInt32(_win.X, _win.Y), DisplayAreaFallback.Nearest).WorkArea;
+        int top = _win.Y;
+        if (top + h > wa.Y + wa.Height - m) top = Math.Max(wa.Y + m, wa.Y + wa.Height - h - m);
+        _win = new RectInt32(_win.X, top, _win.Width, h);
+        AppWindow.MoveAndResize(_win);
+        return true;
     }
 
     // ---------- yeniden adlandırma ----------
@@ -960,11 +1346,18 @@ sealed class PopupWindow : Window
         try
         {
             if (Directory.Exists(target) && !want.Equals(old, StringComparison.OrdinalIgnoreCase)) { _title.Text = old; return; }
+            string oldKey = Order.Key(_folder);
             Directory.Move(_folder, target);
-            Order.Rename(old, want);
-            Tiles.Rename(old, want);
-            if (_dismissFolder.Equals(_folder, StringComparison.OrdinalIgnoreCase)) _dismissFolder = target;
-            _folder = target; _popFolder = target;
+            Order.Rename(oldKey, Order.Key(target));
+            if (_nav.Count == 0)                 // en üst klasör: masaüstü kutusu da yeni adı alır
+            {
+                Tiles.Rename(old, want);
+                if (_dismissFolder.Equals(_folder, StringComparison.OrdinalIgnoreCase)) _dismissFolder = target;
+                _top = target;
+            }
+            Icons.Invalidate(_folder);
+            _folder = target; _popFolder = target; _popSig = "";
+            Populate(_folder);                   // öğelerin yolları yeni klasör adına göre yenilensin
             _title.Text = want;
         }
         catch { _title.Text = old; }

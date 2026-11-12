@@ -35,6 +35,7 @@ public partial class App : Application
             ? a[i + 1]
             : Paths.DefaultRoot();
 
+        Order.Root = root;
         PopupHost.Start(DispatcherQueue.GetForCurrentThread(), root);
         if (Directory.Exists(root)) _ = Task.Run(() => Icons.Prewarm(root));
     }

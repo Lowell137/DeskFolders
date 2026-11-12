@@ -87,7 +87,7 @@ static class Groups
                 string desk = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
                 Directory.Move(folder, Unique(Path.Combine(desk, name)));
             }
-            Order.Forget(name);
+            Order.Forget(Order.Key(folder));
             Icons.Invalidate(folder);
             return true;
         }

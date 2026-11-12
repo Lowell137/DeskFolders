@@ -1,6 +1,6 @@
 ; DeskFolders installer (Inno Setup 6). Per-user install, no admin rights needed.
 #define AppName "DeskFolders"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppExe "GrupPopup.exe"
 
 [Setup]

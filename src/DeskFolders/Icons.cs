@@ -209,13 +209,23 @@ static class Icons
 
     public static void Invalidate(string folder) => _cache.TryRemove(folder, out _);
 
-    /// <summary>Kardeş grup klasörlerinin verisini önceden hazırla.</summary>
+    /// <summary>Kardeş grup klasörlerinin (ve alt klasörlerinin) verisini önceden hazırla.</summary>
     public static void Prewarm(string root)
     {
         try
         {
             foreach (string d in Directory.GetDirectories(root))
-                if (!System.IO.Path.GetFileName(d).StartsWith('_')) GetData(d);
+                if (!System.IO.Path.GetFileName(d).StartsWith('_')) Warm(d, 0);
+        }
+        catch { }
+    }
+
+    static void Warm(string folder, int depth)
+    {
+        try
+        {
+            foreach (ItemData d in GetData(folder))
+                if (depth < 6 && Directory.Exists(d.Path)) Warm(d.Path, depth + 1);
         }
         catch { }
     }
